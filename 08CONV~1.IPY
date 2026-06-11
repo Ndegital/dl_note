@@ -1,0 +1,403 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "id": "2ff8ce5e9513",
+   "metadata": {},
+   "source": [
+    "!pip install japanize-matplotlib"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "code",
+   "id": "cebb08be90c2",
+   "metadata": {},
+   "source": [
+    "# 共通インポート\n",
+    "import numpy as np\n",
+    "import matplotlib.pyplot as plt\n",
+    "import japanize_matplotlib\n",
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.optim as optim\n",
+    "from IPython.display import HTML"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "b5d1b747be60",
+   "metadata": {},
+   "source": [
+    "$$\\def\\bm{\\boldsymbol}$$\n",
+    "$$\\def\\R{\\mathbb{R}}$$\n",
+    "$$\\def\\E{\\mathbb{E}}$$"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "4d913344105b",
+   "metadata": {},
+   "source": [
+    "# 8. 畳み込みニューラルネットワーク (1)\n",
+    "\n",
+    "## 8.1. 畳み込みとは\n",
+    "\n",
+    "画像を全結合層で扱うと、$100 \\times 100$ ピクセルの小さな画像でも入力は 1 万次元になり、\n",
+    "隠れ層 1000 ユニットで 1 千万個の重みが必要です。\n",
+    "さらに「画像の左上の猫」と「右下の猫」を別々に学習しなければならず、明らかに非効率です。\n",
+    "\n",
+    "**畳み込み** (convolution) は、小さな**カーネル**（フィルタ）を画像上で\n",
+    "スライドさせながら同じ重みを使い回す演算です。これにより\n",
+    "\n",
+    "- **局所性**: 近くのピクセルだけを見る（局所受容野）\n",
+    "- **重み共有**: 場所によらず同じパターン検出器を使う（平行移動への頑健性）\n",
+    "\n",
+    "という画像の性質に合った**帰納バイアス**が得られ、パラメータ数も激減します。\n",
+    "虫眼鏡を持って画像の隅々を同じ目で調べて回る探偵をイメージしてください。\n",
+    "\n",
+    "## 8.2. 理論\n",
+    "\n",
+    "### 8.2.1. 2次元畳み込みの定義\n",
+    "\n",
+    "入力（特徴マップ）$\\bm{X} \\in \\R^{H \\times W}$ とカーネル $\\bm{K} \\in \\R^{k_h \\times k_w}$\n",
+    "に対し、出力 $\\bm{Y}$ の各要素は\n",
+    "\n",
+    "$$\n",
+    "Y_{i,j} = \\sum_{u=0}^{k_h - 1} \\sum_{v=0}^{k_w - 1} K_{u,v}\\, X_{i+u,\\, j+v} + b\n",
+    "$$\n",
+    "\n",
+    "と定義されます（深層学習で「畳み込み」と呼ぶ演算は、厳密にはカーネルを反転しない**相互相関**です）。\n",
+    "\n",
+    "### 8.2.2. ストライドとパディング\n",
+    "\n",
+    "- **ストライド** $s$: カーネルを動かす歩幅。$s > 1$ なら出力が空間的に縮小されます。\n",
+    "- **パディング** $p$: 入力の周囲に 0 を詰める幅。境界の情報を保ち、出力サイズを調整します。\n",
+    "\n",
+    "出力サイズは次式で決まります。\n",
+    "\n",
+    "$$\n",
+    "H_{\\text{out}} = \\left\\lfloor \\frac{H + 2p - k_h}{s} \\right\\rfloor + 1, \\qquad\n",
+    "W_{\\text{out}} = \\left\\lfloor \\frac{W + 2p - k_w}{s} \\right\\rfloor + 1\n",
+    "$$\n",
+    "\n",
+    "例えば $3 \\times 3$ カーネル・$s=1$・$p=1$ なら入力と同じサイズの出力が得られます（same パディング）。\n",
+    "\n",
+    "### 8.2.3. 多チャネルへの拡張\n",
+    "\n",
+    "カラー画像のように入力が $C_{\\text{in}}$ チャネルを持つ場合、\n",
+    "カーネルは $\\bm{K} \\in \\R^{C_{\\text{out}} \\times C_{\\text{in}} \\times k_h \\times k_w}$ となり、\n",
+    "出力チャネル $c$ は全入力チャネルにわたる畳み込みの和として計算されます。\n",
+    "パラメータ数は $C_{\\text{out}} (C_{\\text{in}} k_h k_w + 1)$ で、画像サイズに依存しません。"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "2b676312a966",
+   "metadata": {},
+   "source": [
+    "## 8.3. 実装\n",
+    "\n",
+    "NumPy で 2 次元畳み込みをスクラッチ実装します。"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "02c6d58e9444",
+   "metadata": {},
+   "source": [
+    "# 2次元畳み込みのスクラッチ実装\n",
+    "np.random.seed(0)\n",
+    "torch.manual_seed(0)\n",
+    "\n",
+    "def conv2d_scratch(X, K, stride=1, padding=0, bias=0.0):\n",
+    "    \"\"\"単一チャネルの2D畳み込み（相互相関）\"\"\"\n",
+    "    if padding > 0:\n",
+    "        X = np.pad(X, padding, mode=\"constant\")\n",
+    "    H, W = X.shape\n",
+    "    kh, kw = K.shape\n",
+    "    H_out = (H - kh) // stride + 1\n",
+    "    W_out = (W - kw) // stride + 1\n",
+    "    Y = np.zeros((H_out, W_out))\n",
+    "    for i in range(H_out):\n",
+    "        for j in range(W_out):\n",
+    "            # カーネルと重なる領域の要素積の和\n",
+    "            region = X[i * stride: i * stride + kh, j * stride: j * stride + kw]\n",
+    "            Y[i, j] = np.sum(region * K) + bias\n",
+    "    return Y\n",
+    "\n",
+    "# 出力サイズ公式の確認\n",
+    "X = np.random.randn(7, 7)\n",
+    "K = np.random.randn(3, 3)\n",
+    "for s, p in [(1, 0), (1, 1), (2, 0), (2, 1)]:\n",
+    "    Y = conv2d_scratch(X, K, stride=s, padding=p)\n",
+    "    expect = ((7 + 2 * p - 3) // s + 1)\n",
+    "    print(f\"stride={s}, padding={p}: 出力 {Y.shape}（公式: {expect}×{expect}）\")"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cb22340d0863",
+   "metadata": {},
+   "source": [
+    "## 8.4. PyTorch による実装\n",
+    "\n",
+    "`nn.Conv2d` が同じ演算を行います（入力は `(バッチ, チャネル, 高さ, 幅)` の 4 次元テンソル）。\n",
+    "スクラッチ実装と結果が一致することを確認します。"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "c97ec54384c7",
+   "metadata": {},
+   "source": [
+    "# nn.Conv2d との照合\n",
+    "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "print(f\"使用デバイス: {device}\")\n",
+    "\n",
+    "conv = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding=1, bias=True)\n",
+    "# スクラッチ実装と同じ重みを設定\n",
+    "with torch.no_grad():\n",
+    "    conv.weight.copy_(torch.tensor(K, dtype=torch.float32).view(1, 1, 3, 3))\n",
+    "    conv.bias.fill_(0.5)\n",
+    "\n",
+    "X_t = torch.tensor(X, dtype=torch.float32).view(1, 1, 7, 7)  # (N, C, H, W)\n",
+    "Y_torch = conv(X_t).detach().numpy()[0, 0]\n",
+    "Y_scratch = conv2d_scratch(X, K, stride=1, padding=1, bias=0.5)\n",
+    "print(f\"スクラッチ実装と nn.Conv2d の最大差: {np.abs(Y_torch - Y_scratch).max():.2e}\")"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "f64775078dac",
+   "metadata": {},
+   "source": [
+    "## 8.5. 実験・可視化\n",
+    "\n",
+    "### 8.5.1. エッジ検出カーネル\n",
+    "\n",
+    "畳み込みの意味を体感するために、古典的な手設計カーネルを画像に適用します。\n",
+    "CNN はこのようなカーネルを**データから自動的に学習**するモデルだと言えます。"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "648acf03c955",
+   "metadata": {},
+   "source": [
+    "# テスト画像の生成（幾何学パターン）\n",
+    "H = W = 64\n",
+    "img = np.zeros((H, W))\n",
+    "img[16:48, 16:48] = 1.0                      # 正方形\n",
+    "yy, xx = np.mgrid[0:H, 0:W]\n",
+    "img[(yy - 20) ** 2 + (xx - 44) ** 2 < 64] = 0.5  # 円\n",
+    "img += 0.05 * np.random.randn(H, W)          # 少量のノイズ\n",
+    "\n",
+    "kernels = {\n",
+    "    \"横エッジ (Sobel)\": np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=float),\n",
+    "    \"縦エッジ (Sobel)\": np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=float),\n",
+    "    \"ラプラシアン\": np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=float),\n",
+    "    \"平滑化 (平均)\": np.ones((3, 3)) / 9.0,\n",
+    "}\n",
+    "\n",
+    "fig, axes = plt.subplots(1, 5, figsize=(15, 3.2))\n",
+    "axes[0].imshow(img, cmap=\"gray\")\n",
+    "axes[0].set_title(\"入力画像\")\n",
+    "for ax, (name, K) in zip(axes[1:], kernels.items()):\n",
+    "    Y = conv2d_scratch(img, K, padding=1)\n",
+    "    ax.imshow(Y, cmap=\"gray\")\n",
+    "    ax.set_title(name, fontsize=10)\n",
+    "    print(f\"{name}: 出力の値域 [{Y.min():.2f}, {Y.max():.2f}]\")\n",
+    "for ax in axes:\n",
+    "    ax.axis(\"off\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "35bf56b2b76b",
+   "metadata": {},
+   "source": [
+    "Sobel カーネルは特定方向の輝度変化（エッジ）に強く反応し、\n",
+    "ラプラシアンは輪郭全体を、平均カーネルはぼかし（ノイズ除去）を実現します。\n",
+    "「カーネル = パターン検出器」という見方が CNN 理解の出発点です。"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "0aaeed88ca2c",
+   "metadata": {},
+   "source": [
+    "# 学習でエッジ検出カーネルを獲得できるかの実験\n",
+    "# 教師: Sobel フィルタの出力。1枚のConv2dがカーネルを復元できるか\n",
+    "torch.manual_seed(0)\n",
+    "target_K = torch.tensor(kernels[\"横エッジ (Sobel)\"], dtype=torch.float32)\n",
+    "X_imgs = torch.randn(64, 1, 16, 16)  # ランダム画像で学習\n",
+    "with torch.no_grad():\n",
+    "    T = nn.functional.conv2d(X_imgs, target_K.view(1, 1, 3, 3), padding=1)\n",
+    "\n",
+    "learner = nn.Conv2d(1, 1, 3, padding=1, bias=False)\n",
+    "opt = optim.Adam(learner.parameters(), lr=0.05)\n",
+    "losses = []\n",
+    "for epoch in range(300):\n",
+    "    opt.zero_grad()\n",
+    "    loss = nn.functional.mse_loss(learner(X_imgs), T)\n",
+    "    loss.backward()\n",
+    "    opt.step()\n",
+    "    losses.append(loss.item())\n",
+    "print(f\"最終損失: {losses[-1]:.6f}\")\n",
+    "print(\"学習されたカーネル:\")\n",
+    "print(learner.weight.data.view(3, 3).numpy().round(2))\n",
+    "print(\"目標カーネル:\")\n",
+    "print(target_K.numpy())\n",
+    "\n",
+    "fig, axes = plt.subplots(1, 3, figsize=(11, 3))\n",
+    "axes[0].plot(losses); axes[0].set_yscale(\"log\")\n",
+    "axes[0].set_title(\"学習曲線\"); axes[0].set_xlabel(\"エポック\"); axes[0].grid(alpha=0.3)\n",
+    "axes[1].imshow(learner.weight.data.view(3, 3).numpy(), cmap=\"RdBu_r\")\n",
+    "axes[1].set_title(\"学習されたカーネル\")\n",
+    "axes[2].imshow(target_K.numpy(), cmap=\"RdBu_r\")\n",
+    "axes[2].set_title(\"目標 (Sobel)\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "dbac21277489",
+   "metadata": {},
+   "source": [
+    "勾配法だけで Sobel カーネルが復元されました。\n",
+    "実際の CNN では、タスク（分類など）の損失を最小化する過程で、\n",
+    "このようなパターン検出器が**何百枚も自動的に**学習されます。\n",
+    "\n",
+    "## 8.6. 確認問題\n",
+    "\n",
+    "```{admonition} 問 8.1\n",
+    "入力 $32 \\times 32$、カーネル $5 \\times 5$、ストライド 1、パディング 0 のとき\n",
+    "出力サイズを求めよ。また、入力と同じ $32 \\times 32$ の出力を得るには\n",
+    "パディングをいくつにすべきか。\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "c86536724e95",
+   "metadata": {},
+   "source": [
+    "# 問 8.1 の解答欄"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "ea52bca8ee3c",
+   "metadata": {},
+   "source": [
+    "```{admonition} 問 8.2\n",
+    "入力 3 チャネル・出力 64 チャネル・カーネル $3 \\times 3$ の畳み込み層のパラメータ数\n",
+    "（バイアス含む）を求めよ。同じ入出力次元（$224 \\times 224 \\times 3 \\to 224 \\times 224 \\times 64$）を\n",
+    "全結合層で実現した場合のパラメータ数と比較せよ。\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "76b5e9d0c7d6",
+   "metadata": {},
+   "source": [
+    "# 問 8.2 の解答欄"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "da2a0e8c2dc1",
+   "metadata": {},
+   "source": [
+    "```{admonition} 問 8.3\n",
+    "`conv2d_scratch` を多チャネル入力（`X.shape = (C, H, W)`、\n",
+    "`K.shape = (C, kh, kw)`）に拡張し、`nn.Conv2d` と一致することを確認せよ。\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "8b51da7dc667",
+   "metadata": {},
+   "source": [
+    "# 問 8.3 の解答欄"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "7383e683538a",
+   "metadata": {},
+   "source": [
+    "```{admonition} 問 8.4\n",
+    "斜め 45° のエッジに反応するカーネルを自分で設計し、8.5 節の画像に適用して動作を確認せよ。\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "6a9b54b0421d",
+   "metadata": {},
+   "source": [
+    "# 問 8.4 の解答欄"
+   ],
+   "execution_count": null,
+   "outputs": []
+  },
+  {
+   "cell_type": "markdown",
+   "id": "b8d47e2a32ad",
+   "metadata": {},
+   "source": [
+    "```{admonition} 問 8.5\n",
+    "畳み込みが「平行移動と可換」（入力を 1 ピクセルずらすと出力も 1 ピクセルずれる）であることを、\n",
+    "実験で確認せよ。パディングがある場合はどこで等価性が崩れるか。\n",
+    "```"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "id": "6dd493b97cd8",
+   "metadata": {},
+   "source": [
+    "# 問 8.5 の解答欄"
+   ],
+   "execution_count": null,
+   "outputs": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
